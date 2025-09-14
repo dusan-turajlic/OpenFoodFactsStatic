@@ -181,4 +181,4 @@ The Docker setup includes:
 
 ## License
 
-(ODbL) v1.0 [Open Data Commons Open Database License]()
+(ODbL) v1.0 [Open Data Commons Open Database License](https://opendatacommons.org/licenses/odbl/1-0/)

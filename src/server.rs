@@ -88,6 +88,7 @@ async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
             .body(Full::new(Bytes::from(r#"{"error": "Method not allowed"}"#)))
             .unwrap());
     }
@@ -97,6 +98,7 @@ async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
             .body(Full::new(Bytes::from(r#"{"message": "OpenFoodFacts Static Server", "endpoints": ["/static/*"]}"#)))
             .unwrap());
     }
@@ -110,6 +112,7 @@ async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
             .body(Full::new(Bytes::from(r#"{"error": "File not found"}"#)))
             .unwrap());
     }
@@ -120,6 +123,7 @@ async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
             .body(Full::new(Bytes::from(r#"{"error": "Path is a directory"}"#)))
             .unwrap());
     }
@@ -132,6 +136,7 @@ async fn handle_request(
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header("content-type", "application/json")
+                .header("access-control-allow-origin", "*")
                 .body(Full::new(Bytes::from(r#"{"error": "Internal server error"}"#)))
                 .unwrap());
         }
@@ -157,7 +162,8 @@ async fn handle_request(
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", content_type)
-        .header("content-length", file_size.to_string());
+        .header("content-length", file_size.to_string())
+        .header("access-control-allow-origin", "*");
 
     // For .jsonl.gz files, don't set content-encoding since browser will handle decompression
     if content_type == "application/gzip" {

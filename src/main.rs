@@ -44,6 +44,15 @@ struct Macros {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct IndexMacros {
+    kcal: Option<f64>,
+    serving_size: Option<String>,
+    c: Option<f64>,
+    f: Option<f64>,
+    p: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ServingMacros {
     energy_kcal: Option<f64>,
     energy_kj: Option<f64>,
@@ -99,10 +108,12 @@ struct IndexMeta {
 struct CatalogEntry {
     code: String,
     name: Option<String>,
+    creator: Option<String>,
     brand: Option<String>,
     main_category: Option<String>,
     path: String,
     categories: Vec<String>,
+    macros: IndexMacros,
 }
 
 // ---- Helpers ----
@@ -542,6 +553,7 @@ async fn process_batch(
             .collect();
         
         let name = row.get("product_name").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let creator = row.get("creator").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let brand = row.get("brands").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let main_category = row.get("main_category").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         
@@ -571,7 +583,7 @@ async fn process_batch(
         };
         
         let macros = Macros {
-            serving_size,
+            serving_size: serving_size.clone(),
             serving_quantity,
             serving_unit,
             serving,
@@ -597,13 +609,22 @@ async fn process_batch(
         
         // Prepare catalog entry
         let categories = parse_tags(row.get("categories_tags").map(|s| s.as_str()));
+        let index_macros = IndexMacros {
+            kcal: kcal,
+            serving_size: serving_size.clone(),
+            c: to_num(row.get("carbohydrates_100g").map(|s| s.as_str())),
+            f: to_num(row.get("fat_100g").map(|s| s.as_str())),
+            p: to_num(row.get("proteins_100g").map(|s| s.as_str())),
+        };
         let catalog_entry = CatalogEntry {
             code: code.clone(),
             name,
+            creator,
             brand: brand.clone(),
             main_category,
             path: product_path.to_string_lossy().replace('\\', "/"),
             categories: categories.clone(),
+            macros: index_macros,
         };
         
         Ok(Some((catalog_entry, categories, brand)))
