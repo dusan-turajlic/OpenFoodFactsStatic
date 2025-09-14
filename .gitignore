@@ -1,0 +1,30 @@
+# Rust
+/target/
+Cargo.lock
+
+# Generated static files
+/static/
+
+# Raw data (can be large)
+/food_facts_raw_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Node.js (legacy)
+node_modules/
+dist/

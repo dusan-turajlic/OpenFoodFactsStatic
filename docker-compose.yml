@@ -1,0 +1,22 @@
+services:
+  open-food-facts-processor:
+    build: .
+    volumes:
+      # Mount the current directory to access input data and output results
+      - .:/app
+      # Specifically mount the static directory to ensure output is written to host
+      - ./static:/app/static
+      - ./food_facts_raw_data:/app/food_facts_raw_data
+    environment:
+      - RUST_LOG=info
+    # Override the default command to show help if no data is present
+    command: >
+      sh -c "
+        if [ ! -f /app/food_facts_raw_data/products.csv.gz ]; then
+          echo '❌ Error: products.csv.gz not found in food_facts_raw_data/';
+          echo 'Please download the data first using:';
+          echo 'curl -L https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz -o food_facts_raw_data/products.csv.gz';
+          exit 1;
+        fi;
+        target/release/process_data
+      "

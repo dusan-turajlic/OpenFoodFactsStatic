@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Node.js (legacy)
+node_modules
+package-lock.json
+package.json
+tsconfig.json
+eslint.config.js
+
+# TypeScript source (legacy)
+src/*.ts
+
+# Build artifacts
+target
+dist
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Documentation
+README.md
