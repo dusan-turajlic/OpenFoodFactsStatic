@@ -114,8 +114,7 @@ struct CatalogEntry {
     main_category: Option<String>,
     path: String,
     categories: Vec<String>,
-    macros_per_100g: IndexMacros,
-    macros_per_serving: IndexMacros,
+    macros: IndexMacros,
 
 }
 
@@ -553,33 +552,7 @@ async fn process_batch(
             salt: to_num(row.get("salt_serving").map(|s| s.as_str())),
         };
         
-        let macros = Macros {
-            serving_size: serving_size.clone(),
-            serving_quantity: serving_quantity.clone(),
-            serving_unit: serving_unit.clone(),
-            serving: serving.clone(),
-            per100g: per100g.clone(),
-        };
-        
-        let product = Product {
-            code: code.clone(),
-            product_name: name.clone(),
-            brands: brand.clone(),
-            main_category: main_category.clone(),
-            macros,
-        };
-        
-        // Write product file
-        let product_path = Path::new(PRODUCTS_DIR).join(format!("{}.json", code));
-        let file = File::create(&product_path)
-            .with_context(|| format!("Failed to create product file: {:?}", product_path))?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &product)
-            .with_context(|| format!("Failed to write product: {:?}", product_path))?;
-        writer.flush()?;
-        
-        // Prepare catalog entry
-        let categories = parse_tags(row.get("categories_tags").map(|s| s.as_str()));
+        // Prepare index macros for validation
         let index_macros_per_100g = IndexMacros {
             kcal: per100g.energy_kcal,
             serving_size: Some(100.0),
@@ -602,6 +575,58 @@ async fn process_batch(
             p: serving.proteins,
         };
 
+        // Check if serving macros are complete
+        let serving_macros_complete = index_macros_per_serving.kcal.is_some() 
+            && index_macros_per_serving.serving_size.is_some() 
+            && index_macros_per_serving.serving_unit.is_some() 
+            && index_macros_per_serving.fbr.is_some() 
+            && index_macros_per_serving.c.is_some() 
+            && index_macros_per_serving.f.is_some() 
+            && index_macros_per_serving.p.is_some();
+        
+        // Check if per100g macros have at least basic nutritional data
+        let per100g_macros_sufficient = index_macros_per_100g.kcal.is_some() 
+            && (index_macros_per_100g.c.is_some() || index_macros_per_100g.f.is_some() || index_macros_per_100g.p.is_some());
+        
+        // Skip entry entirely if neither serving nor per100g macros are sufficient
+        if !serving_macros_complete && !per100g_macros_sufficient {
+            return Ok(None);
+        }
+
+        let macros = Macros {
+            serving_size: serving_size.clone(),
+            serving_quantity: serving_quantity.clone(),
+            serving_unit: serving_unit.clone(),
+            serving: serving.clone(),
+            per100g: per100g.clone(),
+        };
+        
+        let product = Product {
+            code: code.clone(),
+            product_name: name.clone(),
+            brands: brand.clone(),
+            main_category: main_category.clone(),
+            macros,
+        };
+        
+        // Write product file (only if macros are sufficient)
+        let product_path = Path::new(PRODUCTS_DIR).join(format!("{}.json", code));
+        let file = File::create(&product_path)
+            .with_context(|| format!("Failed to create product file: {:?}", product_path))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &product)
+            .with_context(|| format!("Failed to write product: {:?}", product_path))?;
+        writer.flush()?;
+        
+        // Prepare catalog entry
+        let categories = parse_tags(row.get("categories_tags").map(|s| s.as_str()));
+
+        let macros: IndexMacros = if serving_macros_complete {
+            index_macros_per_serving
+        } else {
+            index_macros_per_100g
+        };
+
         let catalog_entry = CatalogEntry {
             code: code.clone(),
             name,
@@ -610,8 +635,7 @@ async fn process_batch(
             main_category,
             path: product_path.to_string_lossy().replace('\\', "/"),
             categories: categories.clone(),
-            macros_per_100g: index_macros_per_100g,
-            macros_per_serving: index_macros_per_serving,
+            macros
         };
         
         Ok(Some((catalog_entry, categories, brand)))
