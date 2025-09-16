@@ -3,7 +3,7 @@
 Cargo.lock
 
 # Generated static files
-/static/
+/output/
 
 # Raw data (can be large)
 /food_facts_raw_data/

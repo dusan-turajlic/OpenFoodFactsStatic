@@ -16,13 +16,12 @@ use std::time::Instant;
 
 // ---- Config ----
 const INPUT_FILE: &str = "food_facts_raw_data/products.csv.gz";
-const PRODUCTS_DIR: &str = "static/products";
-const INDEX_DIR: &str = "static/indexes";
-const CATALOG_PATH: &str = "static/indexes/catalog.jsonl.gz";
+const PRODUCTS_DIR: &str = "output/static/products";
+const INDEX_DIR: &str = "output/static/indexes";
+const CATALOG_PATH: &str = "output/static/indexes/catalog.jsonl.gz";
 
 const CSV_SEPARATOR: u8 = b'\t';
 const PAGE_SIZE: usize = 500;
-const KJ_PER_KCAL: f64 = 4.184;
 
 // ---- Data Structures ----
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,7 +35,7 @@ struct Product {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Macros {
-    serving_size: Option<String>,
+    serving_size: Option<f64>,
     serving_quantity: Option<f64>,
     serving_unit: Option<String>,
     serving: ServingMacros,
@@ -46,13 +45,15 @@ struct Macros {
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexMacros {
     kcal: Option<f64>,
-    serving_size: Option<String>,
+    serving_size: Option<f64>,
+    serving_unit: Option<String>,
+    fbr: Option<f64>,
     c: Option<f64>,
     f: Option<f64>,
     p: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServingMacros {
     energy_kcal: Option<f64>,
     energy_kj: Option<f64>,
@@ -64,7 +65,7 @@ struct ServingMacros {
     salt: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Per100gMacros {
     energy_kcal: Option<f64>,
     energy_kj: Option<f64>,
@@ -113,7 +114,9 @@ struct CatalogEntry {
     main_category: Option<String>,
     path: String,
     categories: Vec<String>,
-    macros: IndexMacros,
+    macros_per_100g: IndexMacros,
+    macros_per_serving: IndexMacros,
+
 }
 
 // ---- Helpers ----
@@ -151,29 +154,6 @@ fn to_num(v: Option<&str>) -> Option<f64> {
     cleaned.parse().ok().filter(|n: &f64| n.is_finite())
 }
 
-fn derive_kcal(row: &HashMap<String, String>) -> (Option<f64>, Option<f64>) {
-    let kcal = to_num(row.get("energy-kcal_100g").map(|s| s.as_str()));
-    let kj = to_num(row.get("energy-kj_100g").map(|s| s.as_str()));
-    
-    if kcal.is_some() {
-        return (kcal, kj);
-    }
-    
-    if let Some(kj_val) = kj {
-        return (Some((kj_val / KJ_PER_KCAL * 100.0).round() / 100.0), Some(kj_val));
-    }
-    
-    if let Some(e) = to_num(row.get("energy_100g").map(|s| s.as_str())) {
-        if e > 1500.0 {
-            return (Some((e / KJ_PER_KCAL * 100.0).round() / 100.0), Some(e));
-        } else {
-            return (Some(e), None);
-        }
-    }
-    
-    (None, None)
-}
-
 fn parse_tags(raw: Option<&str>) -> Vec<String> {
     let raw = match raw {
         Some(s) => s,
@@ -186,16 +166,16 @@ fn parse_tags(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn parse_serving(row: &HashMap<String, String>) -> (Option<String>, Option<f64>, Option<String>) {
-    let raw_size = row.get("serving_size").map(|s| s.trim()).filter(|s| !s.is_empty());
-    let mut qty = row.get("serving_quantity")
-        .and_then(|s| s.parse().ok());
+fn parse_serving(row: &HashMap<String, String>) -> (Option<f64>, Option<f64>, Option<String>) {
+    let raw_size_str = row.get("serving_size").map(|s| s.as_str());
+    let raw_size = to_num(raw_size_str);
+    let mut qty = to_num(row.get("serving_quantity").map(|s| s.as_str()));
     
-    // If quantity missing, try to extract from serving_size
+    // If quantity missing, try to extract from serving_size string
     if qty.is_none() {
-        if let Some(size) = &raw_size {
+        if let Some(size_str) = raw_size_str {
             let re = Regex::new(r"([\d.,]+)\s*(g|gram|grams|ml|milliliter|milliliters)?").unwrap();
-            if let Some(captures) = re.captures(size) {
+            if let Some(captures) = re.captures(size_str) {
                 if let Some(num_str) = captures.get(1) {
                     let cleaned = num_str.as_str().replace(',', ".");
                     if let Ok(parsed) = cleaned.parse::<f64>() {
@@ -206,24 +186,16 @@ fn parse_serving(row: &HashMap<String, String>) -> (Option<String>, Option<f64>,
         }
     }
     
-    // Extract unit
-    let unit = raw_size
-        .as_ref()
-        .and_then(|size| {
+    // Extract unit from the original string
+    let unit = raw_size_str
+        .and_then(|size_str| {
             let re = Regex::new(r"\b(ml|milliliters?|g|grams?)\b").unwrap();
-            re.captures(size)
+            re.captures(size_str)
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().to_lowercase())
         });
     
-    (raw_size.map(|s| s.to_string()), qty, unit)
-}
-
-fn per_serving(value_per_100g: Option<f64>, qty: Option<f64>) -> Option<f64> {
-    match (value_per_100g, qty) {
-        (Some(val), Some(qty)) => Some((val * (qty / 100.0) * 100.0).round() / 100.0),
-        _ => None,
-    }
+    (raw_size, qty, unit)
 }
 
 // ---- Index Management ----
@@ -556,13 +528,12 @@ async fn process_batch(
         let creator = row.get("creator").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let brand = row.get("brands").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let main_category = row.get("main_category").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        
-        let (kcal, kj) = derive_kcal(&row);
+            
         let (serving_size, serving_quantity, serving_unit) = parse_serving(&row);
-        
+
         let per100g = Per100gMacros {
-            energy_kcal: kcal,
-            energy_kj: kj,
+            energy_kcal: to_num(row.get("energy-kcal_100g").map(|s| s.as_str())),
+            energy_kj: to_num(row.get("energy-kj_100g").map(|s| s.as_str())),
             carbohydrates: to_num(row.get("carbohydrates_100g").map(|s| s.as_str())),
             fat: to_num(row.get("fat_100g").map(|s| s.as_str())),
             proteins: to_num(row.get("proteins_100g").map(|s| s.as_str())),
@@ -572,22 +543,22 @@ async fn process_batch(
         };
         
         let serving = ServingMacros {
-            energy_kcal: per_serving(per100g.energy_kcal, serving_quantity),
-            energy_kj: per_serving(per100g.energy_kj, serving_quantity),
-            carbohydrates: per_serving(per100g.carbohydrates, serving_quantity),
-            fat: per_serving(per100g.fat, serving_quantity),
-            proteins: per_serving(per100g.proteins, serving_quantity),
-            sugars: per_serving(per100g.sugars, serving_quantity),
-            fiber: per_serving(per100g.fiber, serving_quantity),
-            salt: per_serving(per100g.salt, serving_quantity),
+            energy_kcal: to_num(row.get("energy-kcal_serving").map(|s| s.as_str())),
+            energy_kj: to_num(row.get("energy-kj_serving").map(|s| s.as_str())),
+            carbohydrates: to_num(row.get("carbohydrates_serving").map(|s| s.as_str())),
+            fat: to_num(row.get("fat_serving").map(|s| s.as_str())),
+            proteins: to_num(row.get("proteins_serving").map(|s| s.as_str())),
+            sugars: to_num(row.get("sugars_serving").map(|s| s.as_str())),
+            fiber: to_num(row.get("fiber_serving").map(|s| s.as_str())),
+            salt: to_num(row.get("salt_serving").map(|s| s.as_str())),
         };
         
         let macros = Macros {
             serving_size: serving_size.clone(),
-            serving_quantity,
-            serving_unit,
-            serving,
-            per100g,
+            serving_quantity: serving_quantity.clone(),
+            serving_unit: serving_unit.clone(),
+            serving: serving.clone(),
+            per100g: per100g.clone(),
         };
         
         let product = Product {
@@ -609,13 +580,28 @@ async fn process_batch(
         
         // Prepare catalog entry
         let categories = parse_tags(row.get("categories_tags").map(|s| s.as_str()));
-        let index_macros = IndexMacros {
-            kcal: kcal,
-            serving_size: serving_size.clone(),
-            c: to_num(row.get("carbohydrates_100g").map(|s| s.as_str())),
-            f: to_num(row.get("fat_100g").map(|s| s.as_str())),
-            p: to_num(row.get("proteins_100g").map(|s| s.as_str())),
+        let index_macros_per_100g = IndexMacros {
+            kcal: per100g.energy_kcal,
+            serving_size: Some(100.0),
+            serving_unit: Some('g'.to_string()),
+            // Need the fiber so we can calculate the net carbs
+            fbr: per100g.fiber,
+            c: per100g.carbohydrates,
+            f: per100g.fat,
+            p: per100g.proteins,
         };
+
+        let index_macros_per_serving = IndexMacros {
+            kcal: serving.energy_kcal,
+            serving_size: serving_size.clone(),
+            serving_unit: serving_unit.clone(),
+            // Need the fiber so we can calculate the net carbs
+            fbr: serving.fiber,
+            c: serving.carbohydrates,
+            f: serving.fat,
+            p: serving.proteins,
+        };
+
         let catalog_entry = CatalogEntry {
             code: code.clone(),
             name,
@@ -624,7 +610,8 @@ async fn process_batch(
             main_category,
             path: product_path.to_string_lossy().replace('\\', "/"),
             categories: categories.clone(),
-            macros: index_macros,
+            macros_per_100g: index_macros_per_100g,
+            macros_per_serving: index_macros_per_serving,
         };
         
         Ok(Some((catalog_entry, categories, brand)))
