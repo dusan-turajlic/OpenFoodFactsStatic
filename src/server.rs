@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder;
 use std::collections::HashMap;
@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use rcgen::{Certificate as RcgenCert, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+use time::{OffsetDateTime, Duration};
 
 #[derive(Clone)]
 struct ServerState {
@@ -52,10 +55,19 @@ impl ServerState {
                     }
                 }
             }
+            if extension == "br" {
+                if let Some(stem) = file_path.file_stem() {
+                    if let Some(stem_str) = stem.to_str() {
+                        if stem_str.ends_with(".jsonl") {
+                            return "application/x-ndjson";
+                        }
+                    }
+                }
+            }
         }
         
         // Default to JSON for other files
-        "application/json"
+        return "application/json";
     }
 
     fn get_file_path(&self, request_path: &str) -> PathBuf {
@@ -70,6 +82,19 @@ impl ServerState {
         
         file_path
     }
+
+    fn get_content_encoding(&self, file_path: &Path) -> &'static str {
+        if let Some(extension) = file_path.extension() {
+            if extension == "gz" {
+                return "gzip";
+            }
+            if extension == "br" {
+                return "br";
+            }
+        }
+
+        return "utf-8";
+    }
 }
 
 async fn handle_request(
@@ -82,6 +107,16 @@ async fn handle_request(
     let path = uri.path();
 
     info!("🌐 {} {}", method, path);
+
+    if method == Method::OPTIONS {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, OPTIONS")
+            .header("access-control-allow-headers", "*")
+            .body(Full::new(Bytes::from("")))
+            .unwrap());
+    }
 
     // Only handle GET requests
     if method != Method::GET {
@@ -105,6 +140,7 @@ async fn handle_request(
 
     let file_path = state.get_file_path(path);
     let content_type = state.get_content_type(&file_path);
+    let content_encoding = state.get_content_encoding(&file_path);
 
     // Check if file exists
     if !file_path.exists() {
@@ -135,8 +171,8 @@ async fn handle_request(
             warn!("❌ Error reading file {:?}: {}", file_path, e);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("content-type", "application/json")
-                .header("access-control-allow-origin", "*")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Full::new(Bytes::from(r#"{"error": "Internal server error"}"#)))
                 .unwrap());
         }
@@ -159,45 +195,89 @@ async fn handle_request(
     );
 
     // Build response
-    let mut response_builder = Response::builder()
+    info!("--------------------------------");
+    info!("Content encoding: {}", content_encoding);
+    info!("Content type: {}", content_type);
+    info!("--------------------------------");
+    let response_builder = Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", content_type)
-        .header("content-length", file_size.to_string())
-        .header("access-control-allow-origin", "*");
-
-    // For .jsonl.gz files, don't set content-encoding since browser will handle decompression
-    if content_type == "application/gzip" {
-        response_builder = response_builder.header("content-encoding", "");
-    }
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_ENCODING, content_encoding)
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CONTENT_LENGTH, file_size.to_string());
 
     Ok(response_builder
         .body(Full::new(Bytes::from(file_contents)))
         .unwrap())
 }
 
-async fn run_server(addr: &str, static_dir: PathBuf) -> Result<()> {
+fn generate_self_signed_cert() -> Result<(Vec<u8>, Vec<u8>)> {
+    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?;
+    
+    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    params.key_pair = Some(key_pair);
+    params.not_before = OffsetDateTime::now_utc();
+    params.not_after = OffsetDateTime::now_utc() + Duration::days(365); // 1 year
+    
+    let cert = RcgenCert::from_params(params)?;
+    let cert_der = cert.serialize_der()?;
+    let key_der = cert.serialize_private_key_der();
+    
+    Ok((cert_der, key_der))
+}
+
+fn load_tls_config() -> Result<Arc<ServerConfig>> {
+    let (cert_der, key_der) = generate_self_signed_cert()?;
+    
+    let cert = Certificate(cert_der);
+    let key = PrivateKey(key_der);
+    
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    
+    Ok(Arc::new(config))
+}
+
+async fn run_server(static_dir: PathBuf) -> Result<()> {
     let state = ServerState::new(static_dir);
     
+    let addr = "[::]:8443"; // HTTPS default port
     let listener = TcpListener::bind(addr).await
         .with_context(|| format!("Failed to bind to {}", addr))?;
     
-    info!("🚀 Server starting on {}", addr);
+    let tls_config = load_tls_config()?;
+    
+    info!("🚀 HTTPS Server starting on {}", addr);
     info!("📁 Serving files from: {:?}", state.static_dir);
+    info!("🔒 Using self-signed certificate");
     
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
+        let tls_config = tls_config.clone();
         
         tokio::task::spawn(async move {
             let service = service_fn(move |req| handle_request(state.clone(), req));
             
-            let io = hyper_util::rt::TokioIo::new(stream);
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
             
-            if let Err(err) = Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await
-            {
-                warn!("❌ Error serving connection: {}", err);
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    
+                    if let Err(err) = Builder::new(TokioExecutor::new())
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        warn!("❌ Error serving connection: {}", err);
+                    }
+                }
+                Err(err) => {
+                    warn!("❌ TLS handshake failed: {}", err);
+                }
             }
         });
     }
@@ -209,8 +289,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     
     let args: Vec<String> = std::env::args().collect();
-    let addr = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:3000");
-    let static_dir = args.get(2).map(|s| PathBuf::from(s)).unwrap_or_else(|| PathBuf::from("static"));
+    let static_dir = args.get(1).map(|s| PathBuf::from(s)).unwrap_or_else(|| PathBuf::from("static"));
     
     // Ensure static directory exists
     if !static_dir.exists() {
@@ -219,10 +298,9 @@ async fn main() -> Result<()> {
     }
     
     info!("🎯 OpenFoodFacts Static Server");
-    info!("📍 Address: {}", addr);
     info!("📂 Static directory: {:?}", static_dir);
     
-    run_server(addr, static_dir).await?;
+    run_server(static_dir).await?;
     
     Ok(())
 }

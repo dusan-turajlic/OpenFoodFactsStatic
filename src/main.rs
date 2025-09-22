@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use csv::{ReaderBuilder, StringRecord};
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use brotli::enc::BrotliEncoderParams;
+use brotli::CompressorWriter;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
@@ -18,7 +18,7 @@ use std::time::Instant;
 const INPUT_FILE: &str = "food_facts_raw_data/products.csv.gz";
 const PRODUCTS_DIR: &str = "output/static/products";
 const INDEX_DIR: &str = "output/static/indexes";
-const CATALOG_PATH: &str = "output/static/indexes/catalog.jsonl.gz";
+const CATALOG_PATH: &str = "output/static/indexes/catalog.jsonl.br";
 
 const CSV_SEPARATOR: u8 = b'\t';
 const PAGE_SIZE: usize = 500;
@@ -40,17 +40,6 @@ struct Macros {
     serving_unit: Option<String>,
     serving: ServingMacros,
     per100g: Per100gMacros,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexMacros {
-    kcal: Option<f64>,
-    serving_size: Option<f64>,
-    serving_unit: Option<String>,
-    fbr: Option<f64>,
-    c: Option<f64>,
-    f: Option<f64>,
-    p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,16 +95,49 @@ struct IndexMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct IndexMacros {
+    kcal: Option<f64>,
+    serving_size: Option<f64>,
+    serving_unit: Option<String>,
+    fiber: Option<f64>,
+    carbs: Option<f64>,
+    fat: Option<f64>,
+    protein: Option<f64>,
+}
+
+#[derive(Debug)]
 struct CatalogEntry {
     code: String,
     name: Option<String>,
-    creator: Option<String>,
     brand: Option<String>,
-    main_category: Option<String>,
-    path: String,
     categories: Vec<String>,
-    macros: IndexMacros,
+    serving_size: Option<f64>,
+    serving_unit: Option<String>,
+    fiber: Option<f64>,
+    carbs: Option<f64>,
+    fat: Option<f64>,
+    protein: Option<f64>,
+}
 
+impl serde::Serialize for CatalogEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(10))?;
+        seq.serialize_element(&self.code)?;
+        seq.serialize_element(&self.name)?;
+        seq.serialize_element(&self.brand)?;
+        seq.serialize_element(&self.categories)?;
+        seq.serialize_element(&self.serving_size)?;
+        seq.serialize_element(&self.serving_unit)?;
+        seq.serialize_element(&self.fiber)?;
+        seq.serialize_element(&self.carbs)?;
+        seq.serialize_element(&self.fat)?;
+        seq.serialize_element(&self.protein)?;
+        seq.end()
+    }
 }
 
 // ---- Helpers ----
@@ -378,9 +400,10 @@ async fn main() -> Result<()> {
     
     let catalog_file = File::create(CATALOG_PATH)
         .with_context(|| format!("Failed to create catalog file: {}", CATALOG_PATH))?;
-    let catalog_writer = Arc::new(Mutex::new(GzEncoder::new(
+    let catalog_writer = Arc::new(Mutex::new(CompressorWriter::with_params(
         catalog_file,
-        Compression::default(),
+        4096,
+        &BrotliEncoderParams::default(),
     )));
     
     let categories_index = Arc::new(PagedIndex::new(
@@ -478,8 +501,8 @@ async fn main() -> Result<()> {
     println!("   🔄 Closing catalog stream...");
     {
         let mut writer = catalog_writer.lock().unwrap();
-        writer.try_finish()
-            .with_context(|| "Failed to finish catalog compression")?;
+        writer.flush()
+            .with_context(|| "Failed to flush catalog compression")?;
     }
     println!("   ✅ Catalog stream closed");
     
@@ -503,7 +526,7 @@ async fn main() -> Result<()> {
 async fn process_batch(
     batch: &[StringRecord],
     headers: &StringRecord,
-    catalog_writer: &Arc<Mutex<GzEncoder<File>>>,
+    catalog_writer: &Arc<Mutex<CompressorWriter<File>>>,
     categories_index: &Arc<PagedIndex>,
     brands_index: &Arc<PagedIndex>,
     processed_count: &mut usize,
@@ -524,7 +547,6 @@ async fn process_batch(
             .collect();
         
         let name = row.get("product_name").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let creator = row.get("creator").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let brand = row.get("brands").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let main_category = row.get("main_category").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             
@@ -556,12 +578,12 @@ async fn process_batch(
         let index_macros_per_100g = IndexMacros {
             kcal: per100g.energy_kcal,
             serving_size: Some(100.0),
-            serving_unit: Some('g'.to_string()),
+            serving_unit: Some("g".to_string()),
             // Need the fiber so we can calculate the net carbs
-            fbr: per100g.fiber,
-            c: per100g.carbohydrates,
-            f: per100g.fat,
-            p: per100g.proteins,
+            fiber: per100g.fiber,
+            carbs: per100g.carbohydrates,
+            fat: per100g.fat,
+            protein: per100g.proteins,
         };
 
         let index_macros_per_serving = IndexMacros {
@@ -569,24 +591,24 @@ async fn process_batch(
             serving_size: serving_size.clone(),
             serving_unit: serving_unit.clone(),
             // Need the fiber so we can calculate the net carbs
-            fbr: serving.fiber,
-            c: serving.carbohydrates,
-            f: serving.fat,
-            p: serving.proteins,
+            fiber: serving.fiber,
+            carbs: serving.carbohydrates,
+            fat: serving.fat,
+            protein: serving.proteins,
         };
 
         // Check if serving macros are complete
         let serving_macros_complete = index_macros_per_serving.kcal.is_some() 
             && index_macros_per_serving.serving_size.is_some() 
             && index_macros_per_serving.serving_unit.is_some() 
-            && index_macros_per_serving.fbr.is_some() 
-            && index_macros_per_serving.c.is_some() 
-            && index_macros_per_serving.f.is_some() 
-            && index_macros_per_serving.p.is_some();
+            && index_macros_per_serving.fiber.is_some() 
+            && index_macros_per_serving.carbs.is_some() 
+            && index_macros_per_serving.fat.is_some() 
+            && index_macros_per_serving.protein.is_some();
         
         // Check if per100g macros have at least basic nutritional data
         let per100g_macros_sufficient = index_macros_per_100g.kcal.is_some() 
-            && (index_macros_per_100g.c.is_some() || index_macros_per_100g.f.is_some() || index_macros_per_100g.p.is_some());
+            && (index_macros_per_100g.carbs.is_some() || index_macros_per_100g.fat.is_some() || index_macros_per_100g.protein.is_some());
         
         // Skip entry entirely if neither serving nor per100g macros are sufficient
         if !serving_macros_complete && !per100g_macros_sufficient {
@@ -630,12 +652,14 @@ async fn process_batch(
         let catalog_entry = CatalogEntry {
             code: code.clone(),
             name,
-            creator,
             brand: brand.clone(),
-            main_category,
-            path: product_path.to_string_lossy().replace('\\', "/"),
             categories: categories.clone(),
-            macros
+            serving_size: macros.serving_size,
+            serving_unit: macros.serving_unit,
+            fiber: macros.fiber,
+            carbs: macros.carbs,
+            fat: macros.fat,
+            protein: macros.protein,
         };
         
         Ok(Some((catalog_entry, categories, brand)))
@@ -664,7 +688,7 @@ async fn process_batch(
                     c: catalog_entry.code.clone(),
                     n: catalog_entry.name.clone(),
                     b: catalog_entry.brand.clone(),
-                    p: catalog_entry.path.clone(),
+                    p: catalog_entry.code.clone(),
                 };
                 categories_index.add(category, item)?;
             }
@@ -674,7 +698,7 @@ async fn process_batch(
                     c: catalog_entry.code.clone(),
                     n: catalog_entry.name.clone(),
                     b: Some(brand.clone()),
-                    p: catalog_entry.path.clone(),
+                    p: catalog_entry.code.clone(),
                 };
                 brands_index.add(brand, item)?;
             }
